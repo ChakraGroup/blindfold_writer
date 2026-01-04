@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Minimal Writer (File Save + Typewriter/Blindfold Append-Only)</title>
+
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body {
+      font: 18px/1.8 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: #fff; color: #111;
+      display: flex; flex-direction: column;
+    }
+    header, footer {
+      padding: 8px 16px;
+      font-size: 13px;
+      color: #666;
+      border-bottom: 1px solid #eee;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    footer {
+      border-top: 1px solid #eee;
+      border-bottom: 0;
+    }
+    button, label, select {
+      font: 13px system-ui;
+      border: 1px solid #ddd;
+      background: #fff;
+      padding: 6px 10px;
+      border-radius: 10px;
+    }
+    button { cursor: pointer; }
+    button:hover { background: #f7f7f7; }
+    select { cursor: pointer; }
+    textarea {
+      flex: 1;
+      width: 100%;
+      border: 0;
+      outline: none;
+      resize: none;
+      padding: 32px;
+      font: inherit;
+      line-height: 1.8;
+      box-sizing: border-box;
+      caret-color: #111;
+      overflow: auto;
+    }
+    .left { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+    /* Typewriter/Blindfold look (more vertical breathing room) */
+    body.typewriter textarea,
+    body.blindfold textarea {
+      padding-top: 35vh;
+      padding-bottom: 35vh;
+    }
+
+    /* Blindfold: hide text while still allowing input */
+    body.blindfold textarea {
+      color: transparent;
+      text-shadow: 0 0 0 rgba(0,0,0,0); /* keep glyphs invisible */
+      caret-color: #111;               /* caret remains visible */
+    }
+    /* Optional: hide selection highlight in blindfold (best-effort) */
+    body.blindfold textarea::selection {
+      background: transparent;
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <div class="left">
+      <button id="btnSaveAs" title="Pick a file to save to">Save As…</button>
+      <button id="btnSave" title="Save to the chosen file">Save</button>
+
+      <label for="modeSelect" style="display:flex; align-items:center; gap:8px; border:none; padding:0;">
+        <span>Mode:</span>
+        <select id="modeSelect" aria-label="Writing mode">
+          <option value="normal">Normal</option>
+          <option value="typewriter">Typewriter (append-only)</option>
+          <option value="blindfold">Blindfold (append-only, hidden text)</option>
+        </select>
+      </label>
+
+      <span class="mono" id="fileName">No file selected</span>
+    </div>
+    <span id="status">Ready</span>
+  </header>
+
+  <textarea id="editor" placeholder="Start writing…"></textarea>
+
+  <footer>
+    <span class="muted" id="count">0 words</span>
+    <span class="muted">Autosaves to file after you choose “Save As…”</span>
+  </footer>
+
+  <script>
+    // --- Elements ---
+    const editor = document.getElementById("editor");
+    const statusEl = document.getElementById("status");
+    const countEl = document.getElementById("count");
+    const btnSaveAs = document.getElementById("btnSaveAs");
+    const btnSave = document.getElementById("btnSave");
+    const fileNameEl = document.getElementById("fileName");
+    const modeSelect = document.getElementById("modeSelect");
+
+    // --- File handle (File System Access API) ---
+    let fileHandle = null;
+
+    // Persisted setting
+    const KEY_MODE = "minimal-writer:mode";
+
+    // --- Append-only state (Typewriter + Blindfold) ---
+    let lastText = "";                 // last accepted text
+    let appendOnlyMode = "normal";     // "normal" | "typewriter" | "blindfold"
+
+    function isAppendOnly() {
+      return appendOnlyMode === "typewriter" || appendOnlyMode === "blindfold";
+    }
+
+    function setStatus(msg) { statusEl.textContent = msg; }
+
+    function wordCount(text) {
+      const t = text.trim();
+      return t ? t.split(/\s+/).length : 0;
+    }
+
+    function updateStats() {
+      const words = wordCount(editor.value);
+      const chars = editor.value.length;
+      countEl.textContent = `${words} words • ${chars} chars`;
+    }
+
+    function supportsFileSave() {
+      return "showSaveFilePicker" in window;
+    }
+
+    function isAtEnd() {
+      return editor.selectionStart === editor.value.length &&
+             editor.selectionEnd === editor.value.length;
+    }
+
+    function forceCaretToEnd() {
+      const end = editor.value.length;
+      editor.setSelectionRange(end, end);
+    }
+
+    function acceptText(newValue) {
+      editor.value = newValue;
+      lastText = newValue;
+      updateStats();
+      setStatus("Typing…");
+      scheduleAutosave();
+      typewriterScroll();
+    }
+
+    function revertText() {
+      editor.value = lastText;
+      updateStats();
+      typewriterScroll();
+      forceCaretToEnd();
+    }
+
+    function applyMode(mode) {
+      appendOnlyMode = mode;
+
+      // Clear mode classes
+      document.body.classList.toggle("typewriter", mode === "typewriter");
+      document.body.classList.toggle("blindfold", mode === "blindfold");
+
+      if (isAppendOnly()) {
+        // Initialize baseline for append-only behavior
+        lastText = editor.value;
+        forceCaretToEnd();
+      }
+
+      if (mode === "typewriter") setStatus("Typewriter mode (append-only)");
+      else if (mode === "blindfold") setStatus("Blindfold mode (append-only)");
+      else setStatus("Normal mode");
+
+      requestAnimationFrame(() => typewriterScroll());
+    }
+
+    // Scroll helper for Typewriter and Blindfold
+    function typewriterScroll() {
+      if (!isAppendOnly()) return;
+
+      const style = getComputedStyle(editor);
+      const lineHeight = parseFloat(style.lineHeight) || 28;
+
+      const caretIndex = editor.selectionStart ?? 0;
+      const before = editor.value.slice(0, caretIndex);
+      const lines = before.split("\n").length;
+
+      // Rough caret Y based on number of newlines
+      const caretY = (lines - 1) * lineHeight;
+
+      // Keep caret around ~35% from top
+      const target = caretY - (editor.clientHeight * 0.35);
+      editor.scrollTop = Math.max(0, target);
+    }
+
+    async function pickFile() {
+      if (!supportsFileSave()) {
+        alert("Your browser doesn't support saving to a real file here. Try Chrome/Edge, or use a hosted HTTPS page.");
+        return;
+      }
+
+      fileHandle = await window.showSaveFilePicker({
+        suggestedName: "draft.txt",
+        types: [{
+          description: "Text Files",
+          accept: { "text/plain": [".txt"] }
+        }]
+      });
+
+      fileNameEl.textContent = fileHandle.name || "Selected file";
+      setStatus("File selected");
+    }
+
+    async function writeToFile(text) {
+      if (!fileHandle) {
+        setStatus("No file selected");
+        return;
+      }
+
+      // Request permission if needed
+      if (fileHandle.queryPermission && fileHandle.requestPermission) {
+        let perm = await fileHandle.queryPermission({ mode: "readwrite" });
+        if (perm !== "granted") {
+          perm = await fileHandle.requestPermission({ mode: "readwrite" });
+        }
+        if (perm !== "granted") {
+          setStatus("Permission denied");
+          return;
+        }
+      }
+
+      const writable = await fileHandle.createWritable();
+      await writable.write(text);
+      await writable.close();
+      setStatus("Saved to file");
+    }
+
+    // Debounced autosave to file
+    let saveTimer = null;
+    function scheduleAutosave() {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(async () => {
+        if (fileHandle) {
+          try {
+            await writeToFile(editor.value);
+          } catch (e) {
+            setStatus("Save failed");
+            console.error(e);
+          }
+        } else {
+          setStatus("Pick a file (Save As…) to enable autosave");
+        }
+      }, 600);
+    }
+
+    // --- Events ---
+    btnSaveAs.addEventListener("click", async () => {
+      try {
+        await pickFile();
+        await writeToFile(editor.value); // initial write
+      } catch (e) {
+        setStatus("Canceled");
+      }
+    });
+
+    btnSave.addEventListener("click", async () => {
+      try {
+        if (!fileHandle) await pickFile();
+        await writeToFile(editor.value);
+      } catch {
+        setStatus("Canceled");
+      }
+    });
+
+    // Mode select (NO hotkeys)
+    modeSelect.addEventListener("change", () => {
+      const mode = modeSelect.value;
+      localStorage.setItem(KEY_MODE, mode);
+      applyMode(mode);
+      editor.focus();
+    });
+
+    // Append-only guard (best-effort across browsers)
+    editor.addEventListener("beforeinput", (e) => {
+      if (!isAppendOnly()) return;
+
+      // Block any delete/cut operations
+      const blocked = new Set([
+        "deleteContentBackward",
+        "deleteContentForward",
+        "deleteByCut",
+        "deleteByDrag",
+        "deleteWordBackward",
+        "deleteWordForward",
+        "deleteHardLineBackward",
+        "deleteSoftLineBackward"
+      ]);
+
+      if (blocked.has(e.inputType)) {
+        e.preventDefault();
+        forceCaretToEnd();
+        return;
+      }
+
+      // Prevent edits anywhere except at the end (including replacement of selections)
+      if (!isAtEnd()) {
+        e.preventDefault();
+        forceCaretToEnd();
+        return;
+      }
+    });
+
+    // Safety net: block Backspace/Delete in append-only modes
+    editor.addEventListener("keydown", (e) => {
+      if (!isAppendOnly()) return;
+
+      if (e.key === "Backspace" || e.key === "Delete") {
+        e.preventDefault();
+        forceCaretToEnd();
+      }
+    });
+
+    // Force paste to append at end in append-only modes
+    editor.addEventListener("paste", (e) => {
+      if (!isAppendOnly()) return;
+
+      e.preventDefault();
+      const text = (e.clipboardData || window.clipboardData).getData("text");
+      forceCaretToEnd();
+      acceptText(editor.value + text);
+    });
+
+    // Prevent middle insertion via drop in append-only modes
+    editor.addEventListener("drop", (e) => {
+      if (!isAppendOnly()) return;
+
+      e.preventDefault();
+      const text = e.dataTransfer?.getData("text") || "";
+      forceCaretToEnd();
+      if (text) acceptText(editor.value + text);
+    });
+
+    // Input handler: enforce append-only invariant
+    editor.addEventListener("input", () => {
+      if (isAppendOnly()) {
+        // New value must start with previous accepted value (append-only)
+        if (!editor.value.startsWith(lastText)) {
+          revertText();
+          return;
+        }
+        lastText = editor.value;
+        forceCaretToEnd();
+
+        updateStats();
+        setStatus("Typing…");
+        scheduleAutosave();
+        typewriterScroll();
+        return;
+      }
+
+      // Normal mode behavior
+      updateStats();
+      setStatus("Typing…");
+      scheduleAutosave();
+      // (No special scroll in normal mode)
+    });
+
+    // Keep scroll feeling right when caret moves; also keep caret at end in append-only modes
+    editor.addEventListener("keyup", () => typewriterScroll());
+    editor.addEventListener("click", () => {
+      if (isAppendOnly()) forceCaretToEnd();
+      typewriterScroll();
+    });
+    editor.addEventListener("focus", () => {
+      if (isAppendOnly()) forceCaretToEnd();
+      typewriterScroll();
+    });
+
+    // Keep ONLY save hotkey (no mode hotkeys)
+    document.addEventListener("keydown", async (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        try {
+          if (!fileHandle) await pickFile();
+          await writeToFile(editor.value);
+        } catch {
+          setStatus("Canceled");
+        }
+      }
+    });
+
+    // --- Init ---
+    updateStats();
+    editor.focus();
+
+    // Restore mode (default normal)
+    const savedMode = localStorage.getItem(KEY_MODE) || "normal";
+    modeSelect.value = savedMode;
+    applyMode(savedMode);
+
+    // Initialize lastText baseline
+    lastText = editor.value;
+
+    if (!supportsFileSave()) {
+      setStatus("File saving not supported here (try Chrome/Edge over HTTPS)");
+      fileNameEl.textContent = "File saving unsupported";
+    } else {
+      if (savedMode === "typewriter") setStatus("Typewriter mode (append-only)");
+      else if (savedMode === "blindfold") setStatus("Blindfold mode (append-only)");
+      else setStatus("Ready (choose Save As… once)");
+    }
+
+    // One last scroll adjust on load
+    typewriterScroll();
+  </script>
+</body>
+</html>
